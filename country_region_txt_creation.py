@@ -6,20 +6,24 @@ HOW THIS FILE FITS INTO THE BIGGER PICTURE
 After create_table.py builds the Excel workbook, this script reads the
 CountryZoning tab from that Excel file and produces a compact plain-text summary.
 
-The TXT file lists each rate name (e.g. "Express Worldwide") followed by all the
-country codes that belong to that rate, separated by commas.  It looks like this:
+The TXT file lists each **CountryZoning** rate / zone label (left column) followed by
+all **ISO codes** for that group (right column).  The left column is **not** read from
+``addition/dhl_country_codes.txt`` — that file only maps **country names** to codes.
+Short zone names like ``WW_EXP_IMP_ZONE_3`` come from the CountryZoning sheet (same
+normalization as MainCosts: ``…_Zone_N`` not ``…_Zone_Zone N``).
 
   Express Worldwide  DE, FR, IT, ES, NL, BE
-  Economy Select     GB, IE, DK, SE, NO
+  WW_EXP_IMP_ZONE_3  DE, FR, …
 
 When ``extracted_json_path`` is set and the JSON contains ``DemandSurchargeCountries``,
-additional lines are appended after a blank line.  After a header row whose
-``Origin/Destination`` (or ``Origin_Destination``) text names origin territories,
-zone rows use ``DemandSurcharge_Origin_<ZoneToken>``; after a header that names
-destination territories, zone rows use ``DemandSurcharge_Destination_<ZoneToken>``
-(same token rules as the DemandSurcharge Excel tab).  Country names are resolved to
-2-letter codes via ``addition/dhl_country_codes.txt`` where possible; unresolved
-segments are left as in the source.
+additional lines are appended after a blank line.  If a zone appears in both the
+origin and destination country tables with the **same** country list, a single
+``DemandSurcharge_<ZoneToken>`` line is written (from the origin block; the duplicate
+in the destination block is skipped).  If the lists differ, that zone uses
+``DemandSurcharge_Origin_*`` in the origin section and ``DemandSurcharge_Destination_*``
+in the destination section.  Country names are resolved to 2-letter codes via
+``addition/dhl_country_codes.txt`` where possible; unresolved segments are left as
+in the source.
 
 When the JSON contains ``GoGreenPlusCost``, a further blank line and GoGreen block
 lines are appended: ``GoGreenOrigin_1  ES, IT, ...`` (and Destination / Origin_Destination
@@ -35,24 +39,34 @@ import json
 from pathlib import Path           # cross-platform file path handling
 from collections import defaultdict  # used to build a dict of lists (rate name -> [countries])
 
+from expand_additional_zoning import _normalize_zone_label
 from transform_other_tabs import (
     _load_country_codes,
     _gogreen_country_list_to_codes,
     build_gogreen_block_txt_lines,
+    demand_surcharge_global_label,
     demand_surcharge_origin_label,
     demand_surcharge_destination_label,
+    parse_demand_surcharge_zone_country_maps,
+    zone_uses_global_demand_surcharge_label,
 )
 
 
 def _append_demand_surcharge_countries_lines(lines, demand_surcharge_countries, name_to_code):
     """
-    Append DemandSurchargeCountries block: one line per zone
-    ``DemandSurcharge_Origin_<Token>`` or ``DemandSurcharge_Destination_<Token>``,
-    matching the document's Origin vs Destination country tables.
+    Append DemandSurchargeCountries block: one line per zone.
+
+    Uses ``DemandSurcharge_<Token>`` when origin and destination country lists match
+    for that zone; otherwise ``DemandSurcharge_Origin_*`` / ``DemandSurcharge_Destination_*``.
     """
     if not demand_surcharge_countries:
         return
     lines.append("")
+    origin_map, dest_map = parse_demand_surcharge_zone_country_maps(
+        demand_surcharge_countries
+    )
+    # Global zone lines: emit at first encounter (origin or destination), skip duplicate.
+    seen_global = set()
     section = "origin"
     for row in demand_surcharge_countries:
         if not isinstance(row, dict):
@@ -76,13 +90,22 @@ def _append_demand_surcharge_countries_lines(lines, demand_surcharge_countries, 
         if zn is None or not str(zn).strip():
             continue
         zone_name = str(zn).strip()
-        if section == "destination":
-            prefix = demand_surcharge_destination_label(zone_name)
-        else:
-            prefix = demand_surcharge_origin_label(zone_name)
         raw = row.get("Countries") or row.get("countries") or ""
         if not isinstance(raw, str):
             raw = str(raw)
+        use_global = zone_uses_global_demand_surcharge_label(
+            zone_name, origin_map, dest_map
+        )
+        if use_global:
+            if zone_name in seen_global:
+                continue
+            seen_global.add(zone_name)
+            prefix = demand_surcharge_global_label(zone_name)
+        else:
+            if section == "destination":
+                prefix = demand_surcharge_destination_label(zone_name)
+            else:
+                prefix = demand_surcharge_origin_label(zone_name)
         codes = _gogreen_country_list_to_codes(raw, name_to_code) if raw.strip() else ""
         lines.append(f"{prefix}  {codes}")
 
@@ -251,7 +274,8 @@ def create_country_region_txt(
             # -----------------------------------------------------------------------
             for rate_name in sorted(by_rate_name.keys(), key=lambda x: (x == "", x)):
                 countries = by_rate_name[rate_name]
-                line = f"{rate_name}  {', '.join(countries)}"
+                display_rate = _normalize_zone_label(rate_name)
+                line = f"{display_rate}  {', '.join(countries)}"
                 lines.append(line)
 
             print(f"[*] TXT Debug: CountryZoning output lines={len(lines)}")

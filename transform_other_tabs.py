@@ -15,8 +15,9 @@ Public functions:
                          and GoGreenPlusCost (Origin/Destination pass through unchanged)
   pivot_added_rates    – untangles the interleaved header/data rows in AddedRates
   build_demand_surcharge_excel_rows – DemandSurcharge tab (matrix pairs + DemandCosts lines)
-  demand_surcharge_zone_token, demand_surcharge_origin_label, demand_surcharge_destination_label
-                         – canonical DemandSurcharge_Origin_/Destination_ codes for matrix + TXT
+  demand_surcharge_zone_token; demand_surcharge_origin_label / demand_surcharge_destination_label /
+  demand_surcharge_global_label – matrix + TXT; global used when origin & dest country lists match
+  parse_demand_surcharge_zone_country_maps – split DemandSurchargeCountries into origin/dest zone maps
 
 Private helpers:
   _transform_rate_name_to_short
@@ -66,6 +67,103 @@ def demand_surcharge_destination_label(zone_name):
     """e.g. Europe -> DemandSurcharge_Destination_Europe"""
     tok = demand_surcharge_zone_token(zone_name)
     return f'DemandSurcharge_Destination_{tok}' if tok else ''
+
+
+def demand_surcharge_global_label(zone_name):
+    """e.g. Europe -> DemandSurcharge_Europe (when origin/dest country lists match for that zone)."""
+    tok = demand_surcharge_zone_token(zone_name)
+    return f'DemandSurcharge_{tok}' if tok else ''
+
+
+def _normalize_demand_countries_text(s) -> str:
+    """Compare country list strings: ignore case and collapse whitespace."""
+    if s is None:
+        return ''
+    t = re.sub(r'\s+', ' ', str(s).strip().lower())
+    return t
+
+
+def parse_demand_surcharge_zone_country_maps(demand_surcharge_countries):
+    """
+    Split ``DemandSurchargeCountries`` JSON into origin vs destination
+    ``ZoneName -> Countries`` maps (same section headers as TXT).
+
+    Returns:
+        (origin_map, dest_map) — each dict maps zone display name to raw Countries string.
+    """
+    origin_map = {}
+    dest_map = {}
+    section = "origin"
+    for row in demand_surcharge_countries or []:
+        if not isinstance(row, dict):
+            continue
+        od = (
+            row.get("Origin_Destination")
+            or row.get("origin_destination")
+            or row.get("Origin/Destination")
+            or row.get("origin/destination")
+        )
+        if od and str(od).strip():
+            t = str(od).strip().lower()
+            if "origin" in t and "territor" in t:
+                section = "origin"
+                continue
+            if "destination" in t and "territor" in t:
+                section = "destination"
+                continue
+        zn = row.get("ZoneName") or row.get("zoneName")
+        if zn is None or not str(zn).strip():
+            continue
+        zone_name = str(zn).strip()
+        raw = row.get("Countries") or row.get("countries") or ""
+        if not isinstance(raw, str):
+            raw = str(raw)
+        if section == "destination":
+            dest_map[zone_name] = raw
+        else:
+            origin_map[zone_name] = raw
+    return origin_map, dest_map
+
+
+def zone_uses_global_demand_surcharge_label(zone_name, origin_map, dest_map) -> bool:
+    """
+    True if ``zone_name`` appears in both maps with the same (normalized) Countries text.
+    """
+    if not zone_name:
+        return False
+    z = str(zone_name).strip()
+    o = origin_map.get(z)
+    d = dest_map.get(z)
+    if o is None or d is None:
+        return False
+    return _normalize_demand_countries_text(o) == _normalize_demand_countries_text(d)
+
+
+def demand_surcharge_matrix_cell_labels(
+    origin_zone, dest_zone, origin_map, dest_map
+):
+    """
+    Placeholders for the DemandSurcharge Excel matrix.
+
+    If a zone has the **same** country list in both origin and destination country
+    tables (``DemandSurchargeCountries``), that zone uses the global code
+    ``DemandSurcharge_<Token>`` in either column—also for off-diagonal matrix cells
+    (e.g. China and Hong Kong → South Asia), matching the TXT block.
+
+    If country lists differ for that zone name, the column uses
+    ``DemandSurcharge_Origin_*`` or ``DemandSurcharge_Destination_*`` as appropriate.
+    """
+    o = str(origin_zone or "").strip()
+    dd = str(dest_zone or "").strip()
+    if zone_uses_global_demand_surcharge_label(o, origin_map, dest_map):
+        origin_out = demand_surcharge_global_label(o)
+    else:
+        origin_out = demand_surcharge_origin_label(o)
+    if zone_uses_global_demand_surcharge_label(dd, origin_map, dest_map):
+        dest_out = demand_surcharge_global_label(dd)
+    else:
+        dest_out = demand_surcharge_destination_label(dd)
+    return (origin_out, dest_out)
 
 
 def _unwrap_field_cell(value):
@@ -203,7 +301,9 @@ def _find_demand_matrix_descriptor_row(demand_costs):
     return None
 
 
-def build_demand_surcharge_excel_rows(demand_surcharge, demand_costs, metadata):
+def build_demand_surcharge_excel_rows(
+    demand_surcharge, demand_costs, metadata, demand_surcharge_countries=None
+):
     """
     Build rows for the DemandSurcharge Excel tab.
 
@@ -211,6 +311,11 @@ def build_demand_surcharge_excel_rows(demand_surcharge, demand_costs, metadata):
     2) Fill Service from DemandCosts row matching 'Demand Surcharge per origin and destination combination';
        Currency and Rate By from that row's Cost text (e.g. USD, per KG).
     3) Append all DemandCosts rows as plain Service / Cost lines (document text).
+
+    If ``demand_surcharge_countries`` is provided, each column uses
+    ``DemandSurcharge_<Token>`` when that zone’s country list matches in both
+    origin and destination tables; otherwise ``DemandSurcharge_Origin_*`` or
+    ``DemandSurcharge_Destination_*`` (see ``demand_surcharge_matrix_cell_labels``).
     """
     metadata = metadata or {}
     client = (metadata.get('client') or '')
@@ -229,6 +334,10 @@ def build_demand_surcharge_excel_rows(demand_surcharge, demand_costs, metadata):
     matrix_service = _unwrap_field_cell(descriptor.get('Service')) if descriptor else ''
     cost_for_parse = _unwrap_field_cell(descriptor.get('Cost')) if descriptor else ''
     currency, rate_by = _parse_currency_rate_by_from_cost_text(cost_for_parse)
+
+    origin_map, dest_map = parse_demand_surcharge_zone_country_maps(
+        demand_surcharge_countries
+    )
 
     if demand_surcharge:
         normalized_rows = [_normalize_demand_surcharge_row(r) for r in demand_surcharge if isinstance(r, dict)]
@@ -261,8 +370,9 @@ def build_demand_surcharge_excel_rows(demand_surcharge, demand_costs, metadata):
                     dest_for_code = dest_label
                 else:
                     dest_for_code = _fallback_destination_token(dk)
-                origin_out = demand_surcharge_origin_label(origin)
-                dest_out = demand_surcharge_destination_label(dest_for_code)
+                origin_out, dest_out = demand_surcharge_matrix_cell_labels(
+                    origin, dest_for_code, origin_map, dest_map
+                )
                 row = {
                     **base_identity,
                     'Origin': origin_out,
@@ -402,15 +512,17 @@ def _load_country_codes(codes_path=None):
     FILE FORMAT (one country per line, tab-separated):
         France    FR
         Germany   DE
-        China     CN,CHN
+        St. Maarten   SX, MB
 
-    If a country has multiple codes separated by commas, only the first is used.
+    If a country has multiple codes separated by commas, the full field is stored;
+    zone/TXT conversion emits every code; :func:`_country_to_code` still returns
+    the first code for single-code call sites.
 
     The file is looked for in two locations (in order):
       1. input/dhl_country_codes.txt   (next to this script)
       2. addition/dhl_country_codes.txt
 
-    Returns a dictionary like: {"France": "FR", "Germany": "DE", "China": "CN"}
+    Returns a dictionary mapping name -> code field string (may contain commas).
     Returns an empty dict {} if the file is not found.
     """
     if codes_path is None:
@@ -435,9 +547,6 @@ def _load_country_codes(codes_path=None):
         name = name.strip()
         code = code.strip()
 
-        if "," in code:
-            code = code.split(",")[0].strip()
-
         if name:
             name_to_code[name] = code
 
@@ -448,72 +557,51 @@ def _load_country_codes(codes_path=None):
     return name_to_code
 
 
-def _country_to_code(country, name_to_code):
+def _split_country_code_field(code_str):
     """
-    Look up the ISO country code for a given country name string.
+    Split the tab's code column into separate tokens (e.g. ``"SX, MB"`` -> ``["SX", "MB"]``).
+    """
+    if not code_str or not str(code_str).strip():
+        return []
+    return [p.strip() for p in str(code_str).split(",") if p.strip()]
 
-    The country names in the rate card data are not always written exactly the same
-    way as in the reference file.  This function tries several variations to find a match.
 
-    LOOKUP ATTEMPTS (in order, returns the first match found):
-      1. Exact match as-is                   e.g. "France" -> "FR"
-      2. Uppercase version                   e.g. "france" -> "FRANCE" -> "FR"
-      3. Common name normalizations:
-           "Republic Of" <-> "Rep. Of"       e.g. "Republic Of Korea" -> "Rep. Of Korea"
-           " And " <-> " & "                 e.g. "Bosnia And Herzegovina" -> "Bosnia & Herzegovina"
-           Strip ", Peoples Republic" etc.   e.g. "China, Peoples Republic" -> "China"
-      4. Embedded code fallback:
-           If the input is "Afghanistan (AF)", extract "AF" as a last resort.
-
-    Returns the 2-letter (or 3-letter) code string, or '' if nothing matched.
+def _match_country_name_to_code_field(country, name_to_code):
+    """
+    Return the reference file's code column for ``country`` (e.g. ``"FR"`` or ``"SX, MB"``),
+    or None if not matched. Same name-resolution rules as :func:`_country_to_code` but
+    returns the raw field before choosing a single code.
     """
     if not country:
-        return ''
+        return None
     s = str(country).strip()
     if not s:
-        return ''
+        return None
 
-    # Check if the country string already contains an ISO code in parentheses,
-    # e.g. "Afghanistan (AF)".  Save the code as a fallback in case name lookup fails.
-    paren_code = ''
-    m = re.match(r'^(.*?)\s*\(([A-Za-z]{2,3})\)\s*$', s)
+    paren_code = None
+    m = re.match(r"^(.*?)\s*\(([A-Za-z]{2,3})\)\s*$", s)
     if m:
         s = m.group(1).strip()
         paren_code = m.group(2).upper()
 
-    # Attempt 1: exact match
-    code = name_to_code.get(s)
-    if code is not None:
-        return code
-
-    # Attempt 2: uppercase exact match
-    code = name_to_code.get(s.upper())
-    if code is not None:
-        return code
-
-    # Attempt 2b: case-insensitive match (file may have "Kosovo", data may have "KOSOVO")
+    if name_to_code.get(s) is not None:
+        return name_to_code.get(s)
+    if name_to_code.get(s.upper()) is not None:
+        return name_to_code.get(s.upper())
     s_upper = s.upper()
     for key, val in name_to_code.items():
         if key.upper() == s_upper:
             return val
 
-    # Attempt 3: normalised variants
-    variants = []
     n = s.replace("Republic Of", "Rep. Of").replace("Republic of", "Rep. Of")
     n = n.replace(", Republic", ", Rep.").replace(" Republic", " Rep.")
-    variants.append(n)
-    variants.append(n.replace(" And ", " & "))
-    variants.append(n.replace(" & ", " And "))
-
-    # Handle "Name, The" <-> "The Name" pattern
-    # e.g. "Netherlands" -> try "Netherlands, The"
-    #      "Netherlands, The" -> try "Netherlands"
+    variants = [n, n.replace(" And ", " & "), n.replace(" & ", " And ")]
     if n.endswith(", The"):
-        variants.append(n[:-5].strip())           # "Netherlands, The" -> "Netherlands"
+        variants.append(n[:-5].strip())
     else:
-        variants.append(f"{n}, The")              # "Netherlands" -> "Netherlands, The"
+        variants.append(f"{n}, The")
     if n.lower().startswith("the "):
-        variants.append(n[4:].strip() + ", The")  # "The Netherlands" -> "Netherlands, The"
+        variants.append(n[4:].strip() + ", The")
 
     for suffix in (", Peoples Republic", ", People's Republic", ", Peoples Rep.", ", People's Rep.",
                    " Peoples Republic", " People's Republic"):
@@ -525,18 +613,40 @@ def _country_to_code(country, name_to_code):
     for v in variants:
         if not v:
             continue
-        code = name_to_code.get(v)
-        if code is not None:
-            return code
-        code = name_to_code.get(v.upper())
-        if code is not None:
-            return code
-
-    # Attempt 4: use the embedded parenthetical code as a last resort
-    if paren_code:
+        if name_to_code.get(v) is not None:
+            return name_to_code.get(v)
+        if name_to_code.get(v.upper()) is not None:
+            return name_to_code.get(v.upper())
+    if paren_code is not None:
         return paren_code
+    return None
 
-    return ''
+
+def _country_to_codes_list(country, name_to_code):
+    """
+    All codes from the lookup file for a country (multiple if the line lists ``SX, MB``).
+    """
+    raw = _match_country_name_to_code_field(country, name_to_code)
+    if raw is None:
+        return []
+    return _split_country_code_field(str(raw))
+
+
+def _country_to_code(country, name_to_code):
+    """
+    Look up the ISO country code for a given country name string.
+
+    The country names in the rate card data are not always written exactly the same
+    way as in the reference file.  This function tries several variations to find a match
+    (see :func:`_match_country_name_to_code_field`).
+
+    If the file lists several codes (e.g. ``SX, MB``), only the **first** is returned,
+    for call sites that need a single value.
+
+    Returns the 2-letter (or 3-letter) code string, or '' if nothing matched.
+    """
+    codes = _country_to_codes_list(country, name_to_code)
+    return codes[0] if codes else ''
 
 
 # ---------------------------------------------------------------------------
@@ -544,59 +654,66 @@ def _country_to_code(country, name_to_code):
 # GoGreen tab keeps JSON wording. Kept for callers that want coded lists.
 # ---------------------------------------------------------------------------
 
-def _gogreen_segment_to_code(segment, name_to_code):
+def _gogreen_segment_to_codes(segment, name_to_code):
     """
-    Turn one comma-separated segment into a single ISO-style code using dhl_country_codes.txt.
+    Resolve one comma-separated list segment to one or more codes from dhl_country_codes.txt
+    (e.g. ``St. Maarten`` -> ``['SX', 'MB']`` when the file lists both).
 
     Expected segment shapes:
       - "ES - Spain"   (code - name): prefer lookup by country name (right side), else left if 2 letters
-      - "Spain"        (name only): _country_to_code
-      - "ES"           (code only): if 2 letters, return as-is
+      - "Spain"        (name only): :func:`_country_to_codes_list`
+      - "ES"           (code only): if 2 letters, return as a single code
     """
     s = (segment or '').strip()
     if not s:
-        return ''
+        return []
 
     if ' - ' in s:
         left, right = s.split(' - ', 1)
         left, right = left.strip(), right.strip()
-        code = _country_to_code(right, name_to_code)
-        if code:
-            return code
+        codes = _country_to_codes_list(right, name_to_code)
+        if codes:
+            return codes
         if len(left) == 2 and left.isalpha():
-            return left.upper()
-        code = _country_to_code(left, name_to_code)
-        if code:
-            return code
-        return ''
+            return [left.upper()]
+        codes = _country_to_codes_list(left, name_to_code)
+        if codes:
+            return codes
+        return []
 
     if len(s) == 2 and s.isalpha():
-        return s.upper()
+        return [s.upper()]
 
-    return _country_to_code(s, name_to_code) or ''
+    return _country_to_codes_list(s, name_to_code)
 
 
 def _gogreen_country_list_to_codes(text, name_to_code):
     """
-    Convert a comma-separated list like "ES - Spain, IT - Italy" into "ES, IT"
-    using lookups from dhl_country_codes.txt (via _country_to_code).
+    Convert a comma-separated list like "ES - Spain, St. Maarten" into
+    "ES, SX, MB" using dhl_country_codes.txt (all codes for each name).
 
     Segments that do not resolve to a code (e.g. "All other", "All other countries")
     are left exactly as in the source (trimmed), not dropped or altered.
     """
     if not text or not isinstance(text, str):
         return text
-    parts = []
+    out = []
+    seen = set()
     for segment in text.split(','):
         raw = segment.strip()
         if not raw:
             continue
-        code = _gogreen_segment_to_code(segment, name_to_code)
-        if code:
-            parts.append(code)
+        seg_codes = _gogreen_segment_to_codes(segment, name_to_code)
+        if seg_codes:
+            for c in seg_codes:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
         else:
-            parts.append(raw)
-    return ', '.join(parts)
+            if raw not in seen:
+                seen.add(raw)
+                out.append(raw)
+    return ', '.join(out)
 
 
 def _apply_gogreen_plus_cost_country_codes(rows, name_to_code):
@@ -731,10 +848,11 @@ def _gogreen_longest_prefix_country(name, name_to_code):
         if nu[: len(k)] != ku:
             continue
         tail = name[len(k) :].strip()
+        codes_for_key = _split_country_code_field(name_to_code[k])
         if tail == '':
-            return (name_to_code[k], '')
+            return (codes_for_key, '')
         if tail[0] == ',':
-            return (name_to_code[k], tail[1:].strip())
+            return (codes_for_key, tail[1:].strip())
     return None
 
 
@@ -748,16 +866,16 @@ def _gogreen_resolve_segment_to_codes(name, name_to_code):
     if not name:
         return []
 
-    code = _country_to_code(name, name_to_code)
-    if code:
-        return [code]
+    direct = _country_to_codes_list(name, name_to_code)
+    if direct:
+        return direct
 
     pref = _gogreen_longest_prefix_country(name, name_to_code)
     if pref:
-        first_code, rest = pref
+        first_codes, rest = pref
         if not rest:
-            return [first_code]
-        return [first_code] + _gogreen_resolve_segment_to_codes(rest, name_to_code)
+            return first_codes
+        return first_codes + _gogreen_resolve_segment_to_codes(rest, name_to_code)
 
     if ',' not in name:
         return [name]
@@ -855,7 +973,8 @@ def _fill_country_zoning_country_codes(rows, name_to_code):
 
     for row in rows:
         country = row.get('Country') or ''
-        code = _country_to_code(country, name_to_code)
+        codes = _country_to_codes_list(country, name_to_code)
+        code = ", ".join(codes) if codes else ""
         row['Country Code'] = code
 
         if country and code:

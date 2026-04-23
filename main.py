@@ -327,6 +327,52 @@ def process_main_costs(main_costs_field):
     return rate_cards
 
 
+def _normalize_country_zoning_rows(rows):
+    """
+    Fix Azure mis-labels in CountryZoning rows (in-place).
+
+    - When the zone index was extracted as ``Zone1`` (e.g. ``"7"``) instead of ``Zone``,
+      copy it to ``Zone`` and remove ``Zone1``. Only if ``Zone`` is missing/empty.
+    - When ``Zone`` is only a number (e.g. ``"7"``), rewrite to ``"Zone 7"`` so the
+      rest of the pipeline matches ``build_zone_label_lookup`` / CountryZoning tables.
+    """
+    if not rows:
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        z = row.get('Zone')
+        z_blank = (z is None) or (isinstance(z, str) and not str(z).strip())
+        z1 = row.get('Zone1')
+        if z_blank and z1 is not None and str(z1).strip() != '':
+            row['Zone'] = str(z1).strip()
+            del row['Zone1']
+            z = row.get('Zone')
+        if z is None:
+            continue
+        sz = str(z).strip()
+        if re.fullmatch(r'\d+', sz):
+            row['Zone'] = f'Zone {int(sz)}'
+
+
+def _normalize_zoning_matrix_rows(rows):
+    """
+    Azure sometimes labels the origin row key as ``OriginColumn``; the pipeline
+    and ``parse_zoning_matrix`` expect ``OriginZone``. Rename in-place.
+    If both exist and ``OriginZone`` is empty, copy from ``OriginColumn``.
+    """
+    if not rows:
+        return
+    for row in rows:
+        if not isinstance(row, dict) or 'OriginColumn' not in row:
+            continue
+        oz = row.get('OriginZone')
+        oz_blank = (oz is None) or (isinstance(oz, str) and not str(oz).strip())
+        if oz_blank:
+            row['OriginZone'] = row['OriginColumn']
+        del row['OriginColumn']
+
+
 def process_array_field(array_field, field_name):
     """
     Convert a generic Azure array field into a plain list of dictionaries.
@@ -674,6 +720,10 @@ def transform_data(fields, client_name, raw_data=None):
         field = fields.get(field_name)
         if field:
             output[field_name] = process_array_field(field, field_name)
+            if field_name == 'CountryZoning':
+                _normalize_country_zoning_rows(output[field_name])
+            elif field_name == 'ZoningMatrix':
+                _normalize_zoning_matrix_rows(output[field_name])
             print(f"[OK] Processed {field_name}: {len(output[field_name])} items")
         else:
             print(f"[WARN] No {field_name} found in fields")

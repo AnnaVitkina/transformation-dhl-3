@@ -270,7 +270,10 @@ def save_to_excel(data, output_path, accessorial_folder=None):
         demand_costs = data.get('DemandCosts') or []
         if demand_surcharge or demand_costs:
             demand_surcharge_rows = build_demand_surcharge_excel_rows(
-                demand_surcharge, demand_costs, metadata
+                demand_surcharge,
+                demand_costs,
+                metadata,
+                demand_surcharge_countries=data.get("DemandSurchargeCountries") or [],
             )
             if demand_surcharge_rows:
                 write_sheet(wb, "DemandSurcharge", demand_surcharge_rows, metadata)

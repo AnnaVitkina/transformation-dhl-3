@@ -317,7 +317,7 @@ def parse_zoning_matrix(zoning_matrix):
 
     for row in zoning_matrix or []:
         matrix_name = (row.get('MatrixName') or '').strip()
-        origin_zone = (row.get('OriginZone') or '').strip()
+        origin_zone = (row.get('OriginZone') or row.get('OriginColumn') or '').strip()
 
         # Find DestinationZone* keys in this row (may be in same row as MatrixName or in next row)
         dest_keys = sorted(
@@ -640,6 +640,49 @@ def _is_adder_section(rate_card):
     return 'adder rate' in cost_lower and 'additional' in cost_lower
 
 
+def _zone_price_string_is_effectively_zero(v):
+    """True for blank, '-', or numeric 0 in a zone cell."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    if not s or s == '-':
+        return True
+    try:
+        return float(s.replace(',', '').replace(' ', '')) == 0.0
+    except ValueError:
+        return False
+
+
+def _adder_pricing_row_all_zone_prices_zero(price_entry):
+    """
+    True if every zone price in the row is effectively zero (or zone_prices empty).
+    """
+    zp = price_entry.get('zone_prices') or {}
+    if not zp:
+        return True
+    for v in zp.values():
+        if not _zone_price_string_is_effectively_zero(v):
+            return False
+    return True
+
+
+def _filter_adder_pricing_rows(pricing):
+    """
+    For adder sections, find the *last* row (in list order) whose zone prices are
+    all effectively zero. Drop that row and every row before it; keep only
+    rows that follow. If there is no all-zero row, the list is unchanged.
+    """
+    if not pricing:
+        return []
+    last_all_zero: int | None = None
+    for i, pe in enumerate(pricing):
+        if _adder_pricing_row_all_zone_prices_zero(pe):
+            last_all_zero = i
+    if last_all_zero is None:
+        return list(pricing)
+    return list(pricing[last_all_zero + 1 :])
+
+
 def _parse_adder_unit(cost_category_raw):
     """
     Extract the unit value from an adder cost category for the "p/X unit" label.
@@ -918,10 +961,12 @@ def _scan_category_merge_meta(main_costs):
             unit = _parse_adder_unit(cost_category_raw)
             rate_by = f"p/{unit} unit"
             weights_adder = []
-            for pe in pricing:
+            for pe in _filter_adder_pricing_rows(pricing):
                 w = pe.get('weight', '')
                 if w:
                     weights_adder.append(_normalize_adder_weight(w))
+            if not weights_adder:
+                continue
             weights_sorted = sorted(weights_adder, key=_adder_range_sort_key)
             # Include service_type: EXPORT/IMPORT/THIRD often share identical adder *shapes*
             # on the same base category; deduping only (base, rate_by, weights) would skip
@@ -1100,10 +1145,14 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
             unit = _parse_adder_unit(cost_category_raw)
             rate_by = f"p/{unit} unit"
             weights_adder = []
-            for pe in pricing:
+            for pe in _filter_adder_pricing_rows(pricing):
                 w = pe.get('weight', '')
                 if w:
                     weights_adder.append(_normalize_adder_weight(w))
+            if not weights_adder:
+                if _debug_main_costs:
+                    print(f"[DEBUG MainCosts] ADDER skipped (all zone prices zero): service={service_type!r} cost={cost_category_raw!r}")
+                continue
             weights_adder_sorted = sorted(weights_adder, key=_adder_range_sort_key)
             sig = (prev_name, rate_by, tuple(weights_adder_sorted))
             if sig in seen_adder_per_category:
@@ -1186,8 +1235,8 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
         cost_category_raw = rate_card.get('cost_category') or ''
         zone_headers = rate_card.get('zone_headers', {})
         pricing = rate_card.get('pricing', [])
-
         if _is_adder_section(rate_card):
+            pricing = _filter_adder_pricing_rows(pricing)
             if prev_cost_category is None:
                 continue
             cost_category = prev_cost_category

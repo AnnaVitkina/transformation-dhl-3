@@ -20,7 +20,10 @@ import re        # used for pattern matching in text (e.g. finding "Zone 1" patt
 from pathlib import Path   # used for cross-platform file path handling
 
 from accessorial_costs import _best_match_cost_type
-
+from transform_other_tabs import (
+    _load_country_codes,
+    _country_to_codes_list,
+)
 
 # ---------------------------------------------------------------------------
 # I/O helpers
@@ -279,7 +282,7 @@ def parse_zoning_matrix(zoning_matrix):
 
     for row in zoning_matrix or []:
         matrix_name = (row.get('MatrixName') or '').strip()
-        origin_zone = (row.get('OriginZone') or '').strip()
+        origin_zone = (row.get('OriginZone') or row.get('OriginColumn') or '').strip()
 
         if matrix_name:
             # ---------------------------------------------------------------
@@ -837,151 +840,17 @@ def _fill_country_zoning_rate_names(rows):
 
 
 # ---------------------------------------------------------------------------
-# Country code lookup
+# Country code lookup — implementations live in transform_other_tabs.py
+# (_load_country_codes, _country_to_codes_list, …).
 # ---------------------------------------------------------------------------
-
-def _load_country_codes(codes_path=None):
-    """
-    Load the country-name-to-ISO-code dictionary from a plain text file.
-
-    FILE FORMAT (one country per line, tab-separated):
-        France    FR
-        Germany   DE
-        China     CN,CHN
-
-    If a country has multiple codes separated by commas, only the first is used.
-
-    The file is looked for in two locations (in order):
-      1. input/dhl_country_codes.txt   (next to this script)
-      2. addition/dhl_country_codes.txt
-
-    Returns a dictionary like: {"France": "FR", "Germany": "DE", "China": "CN"}
-    Returns an empty dict {} if the file is not found.
-    """
-    if codes_path is None:
-        # Build the default path relative to the location of this script file
-        base = Path(__file__).resolve().parent
-        codes_path = base / "input" / "dhl_country_codes.txt"
-        if not codes_path.exists():
-            codes_path = base / "addition" / "dhl_country_codes.txt"   # try fallback location
-    print(f"[*] CountryCode Debug: trying codes file: {codes_path}")
-    codes_path = Path(codes_path)
-    if not codes_path.exists():
-        print(f"[WARN] CountryCode Debug: codes file not found: {codes_path}")
-        return {}   # return empty dict; country codes will be blank in the output
-
-    name_to_code = {}   # the dictionary we are building
-
-    for line in codes_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or "\t" not in line:
-            continue   # skip blank lines and lines without a tab separator
-
-        # Split on the first tab only.
-        # Everything before the tab = country name; everything after = code(s)
-        name, code = line.split("\t", 1)
-        name = name.strip()
-        code = code.strip()
-
-        # If the code field contains multiple codes (e.g. "CN,CHN"), use only the first
-        if "," in code:
-            code = code.split(",")[0].strip()
-
-        if name:
-            name_to_code[name] = code   # store the mapping
-
-    print(f"[OK] CountryCode Debug: loaded mappings: {len(name_to_code)}")
-    if name_to_code:
-        sample_items = list(name_to_code.items())[:5]
-        print(f"[*] CountryCode Debug: sample mappings: {sample_items}")
-    return name_to_code
-
-
-def _country_to_code(country, name_to_code):
-    """
-    Look up the ISO country code for a given country name string.
-
-    The country names in the rate card data are not always written exactly the same
-    way as in the reference file.  This function tries several variations to find a match.
-
-    LOOKUP ATTEMPTS (in order, returns the first match found):
-      1. Exact match as-is                   e.g. "France" -> "FR"
-      2. Uppercase version                   e.g. "france" -> "FRANCE" -> "FR"
-      3. Common name normalizations:
-           "Republic Of" <-> "Rep. Of"       e.g. "Republic Of Korea" -> "Rep. Of Korea"
-           " And " <-> " & "                 e.g. "Bosnia And Herzegovina" -> "Bosnia & Herzegovina"
-           Strip ", Peoples Republic" etc.   e.g. "China, Peoples Republic" -> "China"
-      4. Embedded code fallback:
-           If the input is "Afghanistan (AF)", extract "AF" as a last resort.
-
-    Returns the 2-letter (or 3-letter) code string, or '' if nothing matched.
-    """
-    if not country:
-        return ''
-    s = str(country).strip()
-    if not s:
-        return ''
-
-    # Check if the country string already contains an ISO code in parentheses,
-    # e.g. "Afghanistan (AF)".  Save the code as a fallback in case name lookup fails.
-    paren_code = ''
-    m = re.match(r'^(.*?)\s*\(([A-Za-z]{2,3})\)\s*$', s)
-    if m:
-        s = m.group(1).strip()        # remove the "(AF)" part; keep just "Afghanistan"
-        paren_code = m.group(2).upper()   # save "AF" as fallback
-
-    # Attempt 1: exact match
-    code = name_to_code.get(s)
-    if code is not None:
-        return code
-
-    # Attempt 2: uppercase exact match (handles case differences)
-    code = name_to_code.get(s.upper())
-    if code is not None:
-        return code
-
-    # Attempt 3: build a list of normalised variants and try each one
-    variants = []
-    # Normalise "Republic Of" -> "Rep. Of" (common abbreviation difference)
-    n = s.replace("Republic Of", "Rep. Of").replace("Republic of", "Rep. Of")
-    n = n.replace(", Republic", ", Rep.").replace(" Republic", " Rep.")
-    variants.append(n)
-    variants.append(n.replace(" And ", " & "))   # "Bosnia And Herzegovina" -> "Bosnia & Herzegovina"
-    variants.append(n.replace(" & ", " And "))   # reverse: "Bosnia & Herzegovina" -> "Bosnia And Herzegovina"
-
-    # Strip ", Peoples Republic" suffixes to get the base country name
-    # e.g. "China, Peoples Republic" -> "China"
-    for suffix in (", Peoples Republic", ", People's Republic", ", Peoples Rep.", ", People's Rep.",
-                   " Peoples Republic", " People's Republic"):
-        if n.endswith(suffix) or suffix in n:
-            base = n.replace(suffix, "").strip().strip(",").strip()
-            if base:
-                variants.append(base)
-
-    # Try each variant (both as-is and uppercase)
-    for v in variants:
-        if not v:
-            continue
-        code = name_to_code.get(v)
-        if code is not None:
-            return code
-        code = name_to_code.get(v.upper())
-        if code is not None:
-            return code
-
-    # Attempt 4: use the embedded parenthetical code as a last resort
-    if paren_code:
-        return paren_code
-
-    return ''   # no match found at all
-
 
 def _fill_country_zoning_country_codes(rows, name_to_code):
     """
     Add a 'Country Code' column to every CountryZoning row by looking up
     the value in the 'Country' column against the name_to_code dictionary.
 
-    After this runs, each row will have a new 'Country Code' field, e.g. "FR" for France.
+    After this runs, each row will have a new 'Country Code' field, e.g. "FR" for France
+    or "SX, MB" when the reference file lists multiple codes for one territory.
     Rows where the country name could not be matched will have an empty 'Country Code'.
 
     At the end, a summary is printed showing how many countries were matched vs missed,
@@ -993,8 +862,9 @@ def _fill_country_zoning_country_codes(rows, name_to_code):
 
     for row in rows:
         country = row.get('Country') or ''
-        code = _country_to_code(country, name_to_code)   # look up the code
-        row['Country Code'] = code   # write the result back into the row
+        codes = _country_to_codes_list(country, name_to_code)
+        code = ", ".join(codes) if codes else ""
+        row['Country Code'] = code
 
         if country and code:
             matched += 1   # successfully resolved

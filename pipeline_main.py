@@ -39,13 +39,13 @@ from pathlib import Path   # cross-platform file path handling
 #   - Local paths: used when running on a local Windows machine
 
 # --- Google Drive paths (Colab) ---
-HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/input json"
-HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/archive"
-HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/clients.txt"
-HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/dhl_country_codes.txt"
-#HARDCODED_ACCESSORIAL_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/Accessorial Costs.xlsx"
-HARDCODED_ACCESSORIAL_FILE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/Accessorial Costs"
-HARDCODED_OUTPUT_DIR = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/output"
+HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/input json"
+HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/archive"
+HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/addition/clients.txt"
+HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/addition/dhl_country_codes.txt"
+#HARDCODED_ACCESSORIAL_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/addition/Accessorial Costs.xlsx"
+HARDCODED_ACCESSORIAL_FILE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/Accessorial Costs"
+HARDCODED_OUTPUT_DIR = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_DHL/output"
 
 # --- Local Windows paths (used when Drive is not available) ---
 LOCAL_INPUT_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\tranformation-rate\input"

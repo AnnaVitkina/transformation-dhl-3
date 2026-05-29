@@ -26,8 +26,9 @@ in the destination section.  Country names are resolved to 2-letter codes via
 in the source.
 
 When the JSON contains ``GoGreenPlusCost``, a further blank line and GoGreen block
-lines are appended: ``GoGreenOrigin_1  ES, IT, ...`` (and Destination / Origin_Destination
-variants), matching the placeholders written to the GoGreenPlusCost Excel tab.
+lines are appended per block read: ``GoGreen_Americas`` when codes fully match the
+classical list, otherwise ``GoGreen_Americas_1``, ``GoGreen_Asia_Pacific_2``, etc.
+(``| not detected`` / ``| extra`` annotations), matching the GoGreenPlusCost Excel tab.
 
 This file is useful for quickly checking which countries are covered by each rate
 without opening the full Excel workbook.

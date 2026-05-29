@@ -577,6 +577,16 @@ def _match_country_name_to_code_field(country, name_to_code):
     s = str(country).strip()
     if not s:
         return None
+    original = s
+
+    # Prefer full name in reference file before ``(XX)`` is treated as an ISO code.
+    # e.g. "Virgin Islands (US)" -> VI, not US from parentheses.
+    if name_to_code.get(original) is not None:
+        return name_to_code.get(original)
+    orig_upper = original.upper()
+    for key, val in name_to_code.items():
+        if key.upper() == orig_upper:
+            return val
 
     paren_code = None
     m = re.match(r"^(.*?)\s*\(([A-Za-z]{2,3})\)\s*$", s)
@@ -595,7 +605,7 @@ def _match_country_name_to_code_field(country, name_to_code):
 
     n = s.replace("Republic Of", "Rep. Of").replace("Republic of", "Rep. Of")
     n = n.replace(", Republic", ", Rep.").replace(" Republic", " Rep.")
-    variants = [n, n.replace(" And ", " & "), n.replace(" & ", " And ")]
+    variants = [original, n, n.replace(" And ", " & "), n.replace(" & ", " And ")]
     if n.endswith(", The"):
         variants.append(n[:-5].strip())
     else:
@@ -604,11 +614,33 @@ def _match_country_name_to_code_field(country, name_to_code):
         variants.append(n[4:].strip() + ", The")
 
     for suffix in (", Peoples Republic", ", People's Republic", ", Peoples Rep.", ", People's Rep.",
-                   " Peoples Republic", " People's Republic"):
+                   " Peoples Republic", " People's Republic",
+                   ", Democratic Republic", " Democratic Republic"):
         if n.endswith(suffix) or suffix in n:
             base = n.replace(suffix, "").strip().strip(",").strip()
             if base:
                 variants.append(base)
+
+    # GoGreen OCR: ``SERBIA, REPUBLIC OF`` -> ``Serbia, Rep. Of`` in reference file
+    if re.search(r',?\s*REPUBLIC\s+OF\s*$', n, re.I):
+        base = re.sub(r',?\s*REPUBLIC\s+OF\s*$', '', n, flags=re.I).strip().strip(',').strip()
+        if base:
+            variants.extend([
+                f"{base}, Rep. Of",
+                f"{base}, Republic of",
+                f"Republic of {base}",
+            ])
+
+    # ``RUSSIAN FEDERATION, THE`` / ``NETHERLANDS, THE`` -> reference file forms
+    if re.search(r',?\s*THE\s*$', n, re.I):
+        base = re.sub(r',?\s*THE\s*$', '', n, flags=re.I).strip().strip(',').strip()
+        if base:
+            variants.extend([f"{base}, The", f"The {base}"])
+
+    # Lao PDR long form (e.g. from DemandSurchargeCountries) -> Laos
+    s_lower = s.lower()
+    if 'lao' in s_lower and ('democratic' in s_lower or "people" in s_lower):
+        variants.extend(['Laos', 'Lao', "Lao People's Democratic Republic"])
 
     for v in variants:
         if not v:
@@ -654,37 +686,116 @@ def _country_to_code(country, name_to_code):
 # GoGreen tab keeps JSON wording. Kept for callers that want coded lists.
 # ---------------------------------------------------------------------------
 
-def _gogreen_segment_to_codes(segment, name_to_code):
+def _strip_region_equals_prefix(text):
     """
-    Resolve one comma-separated list segment to one or more codes from dhl_country_codes.txt
-    (e.g. ``St. Maarten`` -> ``['SX', 'MB']`` when the file lists both).
+    Remove leading ``= `` or ``ZoneName = `` from demand-surcharge country lists.
+
+    Azure may extract ``= Australia, ...``, ``Oceania = Australia, ...``, or
+    ``Europe = Albania, ...`` instead of a plain country list.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    s = text.strip()
+    # IT merged PDF: "= Australia, Brunei, ..."
+    if s.startswith('='):
+        s = s[1:].strip()
+    if ',' in s:
+        first, rest = s.split(',', 1)
+        m = re.match(r'^([^=]+)=\s*(.+)$', first.strip())
+        if m and m.group(2).strip():
+            return f"{m.group(2).strip()}, {rest.strip()}"
+    else:
+        m = re.match(r'^([^=]+)=\s*(.+)$', s)
+        if m and m.group(2).strip():
+            return m.group(2).strip()
+    return s
+
+
+def _gogreen_valid_codes_from_file(name_to_code):
+    """All ISO tokens listed in dhl_country_codes.txt (values column, comma-separated)."""
+    valid = set()
+    for field in (name_to_code or {}).values():
+        for c in _split_country_code_field(str(field)):
+            valid.add(c.upper())
+    return valid
+
+
+def _gogreen_normalize_country_name_for_lookup(name):
+    """Normalize OCR names so they match dhl_country_codes.txt keys (e.g. ST. -> St.)."""
+    s = (name or '').strip()
+    if not s:
+        return s
+    s = re.sub(r'\bST\.', 'St.', s, flags=re.I)
+    return s
+
+
+def _country_to_codes_list_gogreen(country, name_to_code, valid_codes=None):
+    """
+    GoGreen: return codes only from dhl_country_codes.txt for the country **name**.
+
+    PDF prefix letters (e.g. ``XY`` in ``XY - ST. BARTHELEMY``) are never used; lookup
+    ``ST. BARTHELEMY`` -> ``St. Barthelemy`` -> ``BL``.
+    """
+    if valid_codes is None:
+        valid_codes = _gogreen_valid_codes_from_file(name_to_code)
+    country = _gogreen_normalize_country_name_for_lookup(country)
+    raw = _match_country_name_to_code_field(country, name_to_code)
+    if raw is None:
+        return []
+    codes = _split_country_code_field(str(raw))
+    return [c for c in codes if c.upper() in valid_codes]
+
+
+def _gogreen_try_code_name_pair(s, name_to_code, valid_codes=None):
+    """
+    ``PL POLAND``, ``MM MYANMAR``, ``XY - ST. BARTHELEMY`` (name part only) -> code from file.
+
+    The left token from the PDF is ignored unless the country name cannot be matched.
+    """
+    m = re.match(r'^([A-Z]{2,3})\s+(.+)$', (s or '').strip())
+    if not m:
+        return []
+    name_part = m.group(2).strip()
+    return _country_to_codes_list_gogreen(name_part, name_to_code, valid_codes)
+
+
+def _gogreen_segment_to_codes(segment, name_to_code, valid_codes=None):
+    """
+    Resolve one GoGreen list segment to codes **only** from dhl_country_codes.txt.
 
     Expected segment shapes:
-      - "ES - Spain"   (code - name): prefer lookup by country name (right side), else left if 2 letters
-      - "Spain"        (name only): :func:`_country_to_codes_list`
-      - "ES"           (code only): if 2 letters, return as a single code
+      - "XY - ST. BARTHELEMY"  -> lookup ``ST. BARTHELEMY`` -> ``BL`` (not ``XY``)
+      - "PL POLAND"            -> lookup ``POLAND`` -> ``PL``
+      - "Spain"                -> lookup country name
+      - "ES"                   -> ``ES`` only if ``ES`` appears in the reference file
     """
-    s = (segment or '').strip()
+    if valid_codes is None:
+        valid_codes = _gogreen_valid_codes_from_file(name_to_code)
+    s = (segment or '').strip().lstrip('-').strip()
     if not s:
         return []
 
-    if ' - ' in s:
-        left, right = s.split(' - ', 1)
-        left, right = left.strip(), right.strip()
-        codes = _country_to_codes_list(right, name_to_code)
-        if codes:
-            return codes
-        if len(left) == 2 and left.isalpha():
-            return [left.upper()]
-        codes = _country_to_codes_list(left, name_to_code)
-        if codes:
-            return codes
-        return []
+    pair_codes = _gogreen_try_code_name_pair(s, name_to_code, valid_codes)
+    if pair_codes:
+        return pair_codes
 
-    if len(s) == 2 and s.isalpha():
+    if ' - ' in s:
+        _left, right = s.split(' - ', 1)
+        return _country_to_codes_list_gogreen(right.strip(), name_to_code, valid_codes)
+
+    if len(s) in (2, 3) and s.isalpha() and s.upper() in valid_codes:
         return [s.upper()]
 
-    return _country_to_codes_list(s, name_to_code)
+    codes = _country_to_codes_list_gogreen(s, name_to_code, valid_codes)
+    if codes:
+        return codes
+
+    if '=' in s and ' - ' not in s:
+        m = re.match(r'^([^=]+)=\s*(.+)$', s)
+        if m:
+            return _country_to_codes_list_gogreen(m.group(2).strip(), name_to_code, valid_codes)
+
+    return []
 
 
 def _gogreen_country_list_to_codes(text, name_to_code):
@@ -697,13 +808,15 @@ def _gogreen_country_list_to_codes(text, name_to_code):
     """
     if not text or not isinstance(text, str):
         return text
+    text = _strip_region_equals_prefix(text)
+    valid_codes = _gogreen_valid_codes_from_file(name_to_code)
     out = []
     seen = set()
     for segment in text.split(','):
         raw = segment.strip()
         if not raw:
             continue
-        seg_codes = _gogreen_segment_to_codes(segment, name_to_code)
+        seg_codes = _gogreen_segment_to_codes(segment, name_to_code, valid_codes)
         if seg_codes:
             for c in seg_codes:
                 if c not in seen:
@@ -733,6 +846,20 @@ def _normalize_gogreen_name_part(s):
     return re.sub(r'\s+', ' ', str(s).strip())
 
 
+def _normalize_gogreen_cell(text):
+    """Flatten OCR newlines and fix common hyphen/glue issues before code extraction."""
+    if not text or not isinstance(text, str):
+        return ''
+    t = text.replace('\n', ', ')
+    t = re.sub(r'\s+', ' ', t)
+    t = re.sub(r'([A-Z]{2,3})-\s*', r'\1 - ', t)
+    t = re.sub(r',\s*-\s*', ', ', t)
+    # ``MARIANA ISLANDS FJ - FIJI`` -> insert comma before next code
+    t = re.sub(r'(?<=[A-Za-z])\s+(?=[A-Z]{2,3}\s*-\s*)', ', ', t)
+    t = re.sub(r'(?<=[A-Za-z])\s+(?=[A-Z]{2,3}\s+[A-Z])', ', ', t)
+    return t.strip()
+
+
 def parse_gogreen_block_names(text):
     """
     Parse a GoGreen Origin/Destination cell into a tuple of country/territory names
@@ -743,18 +870,18 @@ def parse_gogreen_block_names(text):
     """
     if not text or not isinstance(text, str):
         return None
-    t = text.replace('\n', ' ').strip()
+    t = _normalize_gogreen_cell(text)
     if not t:
         return None
     tl = t.lower()
     if tl == 'all other' or tl.startswith('all other '):
         return None
 
-    # Split only before ``XX - `` style codes (comma may appear inside a NAME)
-    parts = re.split(r',\s*(?=[A-Z]{2,3}\s*-)', t)
+    # Split before ``XX - `` or ``XX NAME`` (e.g. PL POLAND, MM MYANMAR)
+    parts = re.split(r',\s*(?=[A-Z]{2,3}\s*(?:-|\s+[A-Z]))', t)
     names = []
     for p in parts:
-        p = p.strip()
+        p = p.strip().lstrip('-').strip()
         if not p:
             continue
         m = re.match(r'^([A-Z]{2,3})\s*-\s*(.*)$', p, re.DOTALL)
@@ -769,7 +896,9 @@ def parse_gogreen_block_names(text):
             if name:
                 names.append(name)
             continue
-        names.append(_normalize_gogreen_name_part(p))
+        name = _normalize_gogreen_name_part(p)
+        if name and name.lower() not in ('all other',):
+            names.append(name)
 
     if not names:
         return None
@@ -804,12 +933,127 @@ def _collect_gogreen_block_roles(rows):
     return order, flags
 
 
-def _assign_gogreen_placeholder_labels(order, flags):
+# Canonical GoGreen zones: classify converted ISO codes by overlap with these lists.
+GOGREEN_CANONICAL_ZONES = {
+    'GoGreen_Americas': frozenset(
+        'AG AI AR AS AW BB BM BO BR BS BZ CA CL CO CR CU DM DO EC FM GD GF GP GT GU GY HN HT JM KN KY LC MH MP MQ MS MX NI PA PE PR PW PY SR SV TC TT US UY VC VE VG VI XB CW OK XE MF XN BL'.split()
+    ),
+    'GoGreen_Asia_Pacific': frozenset(
+        'AU BD BN BT CK CN FJ HK ID IN JP KH KI KP KR LA LK MM MN MO MV MY NC NP NR NU NZ PF PG PH PK SB SG TH TL TO TV TW VN VU WS'.split()
+    ),
+    'GoGreen_Europe_Central_Asia_and_Middle_East': frozenset(
+        'AD AL AM AT AZ BA BE BG BY CH CY CZ DE DK EE ES FI FK FO FR GB GE GG GI GL GR HR HU ZE IE IL IS IT JE KG XK KZ LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS RU SE SI SK SM TJ TM TR UA UZ VA'.split()
+    ),
+}
+
+GOGREEN_ZONE_DISPLAY_ORDER = (
+    'GoGreen_Americas',
+    'GoGreen_Asia_Pacific',
+    'GoGreen_Europe_Central_Asia_and_Middle_East',
+)
+
+_GOGREEN_ALL_OTHER_TAIL = re.compile(r',?\s*All other\s*$', re.I)
+
+
+def _gogreen_codes_from_csv_string(codes_csv):
+    """Parse a comma-separated code list; keep 2–3 letter tokens only."""
+    out = []
+    for part in (codes_csv or '').split(','):
+        p = part.strip()
+        if re.match(r'^[A-Za-z]{2,3}$', p):
+            out.append(p.upper())
+    return out
+
+
+def _gogreen_cell_to_code_set(text, name_to_code):
+    """Return ISO codes detected from a GoGreen cell (excludes ``All other``)."""
+    csv_str = _gogreen_cell_to_codes(text, name_to_code)
+    if not csv_str or csv_str.strip().lower().startswith('all other'):
+        return set()
+    return set(_gogreen_codes_from_csv_string(csv_str))
+
+
+def _gogreen_pick_canonical_zone(code_set):
+    """Choose the canonical zone with the largest overlap with ``code_set``."""
+    if not code_set:
+        return GOGREEN_ZONE_DISPLAY_ORDER[2]
+    best_zone = GOGREEN_ZONE_DISPLAY_ORDER[0]
+    best_score = -1
+    for zone in GOGREEN_ZONE_DISPLAY_ORDER:
+        ref = GOGREEN_CANONICAL_ZONES[zone]
+        score = len(code_set & ref)
+        if score > best_score:
+            best_score = score
+            best_zone = zone
+    return best_zone
+
+
+def _gogreen_base_zone_from_display_label(display_label):
+    """``GoGreen_Americas_2`` -> ``GoGreen_Americas``; ``GoGreen_Americas`` unchanged."""
+    for base in GOGREEN_ZONE_DISPLAY_ORDER:
+        if display_label == base or display_label.startswith(base + '_'):
+            return base
+    return GOGREEN_ZONE_DISPLAY_ORDER[2]
+
+
+def _gogreen_zone_fully_matches(code_set, base_zone):
+    """True when converted codes exactly match the classical list for ``base_zone``."""
+    ref = GOGREEN_CANONICAL_ZONES[base_zone]
+    converted = {c.upper() for c in (code_set or set()) if c}
+    return converted == ref
+
+
+def _gogreen_format_canonical_zone_line(display_label, code_set):
     """
-    Origin-only  -> GoGreenOrigin_n
-    Dest-only    -> GoGreenDestination_n
-    In both      -> GoGreenOrigin_Destination_n
+    ``GoGreen_Europe_...  ES, IT, ... | not detected RU | extra XX``
+
+    ``display_label`` may be ``GoGreen_Americas`` (full match) or ``GoGreen_Americas_1``.
     """
+    base_zone = _gogreen_base_zone_from_display_label(display_label)
+    ref = GOGREEN_CANONICAL_ZONES[base_zone]
+    converted = {c.upper() for c in code_set if c}
+    detected = sorted(converted & ref)
+    not_detected = sorted(ref - converted)
+    extra = sorted(converted - ref)
+    parts = [display_label, ', '.join(detected)]
+    if not_detected:
+        parts.append('not detected ' + ', '.join(not_detected))
+    if extra:
+        parts.append('extra ' + ', '.join(extra))
+    return '  '.join(parts[:2]) + (' | ' + ' | '.join(parts[2:]) if len(parts) > 2 else '')
+
+
+def _gogreen_assign_display_labels(order, raw_by_key, name_to_code):
+    """
+    One display label per GoGreen block read from the PDF.
+
+    - Best overlap picks base zone (Americas / Asia Pacific / Europe+).
+    - Exact match with classical list -> ``GoGreen_Americas`` (no suffix).
+    - Otherwise -> ``GoGreen_Americas_1``, ``GoGreen_Americas_2``, … per base zone.
+    """
+    label_by_key = {}
+    partial_counters = {z: 0 for z in GOGREEN_ZONE_DISPLAY_ORDER}
+    for key in order:
+        raw = raw_by_key.get(key, '')
+        codes = _gogreen_cell_to_code_set(raw, name_to_code) if raw else set()
+        if not codes:
+            codes = set(_gogreen_codes_from_csv_string(_gogreen_key_to_codes_csv(key, name_to_code)))
+        base = _gogreen_pick_canonical_zone(codes)
+        if _gogreen_zone_fully_matches(codes, base):
+            label_by_key[key] = base
+        else:
+            partial_counters[base] += 1
+            label_by_key[key] = f'{base}_{partial_counters[base]}'
+    return label_by_key
+
+
+def _assign_gogreen_placeholder_labels(order, flags, raw_by_key=None, name_to_code=None):
+    """
+    Assign GoGreen zone labels (full classical match or numbered per zone).
+    Falls back to legacy numbered labels only when canonical assignment is unavailable.
+    """
+    if raw_by_key is not None and name_to_code is not None:
+        return _gogreen_assign_display_labels(order, raw_by_key, name_to_code)
     label_by_key = {}
     o_only = [k for k in order if flags[k]['o'] and not flags[k]['d']]
     d_only = [k for k in order if flags[k]['d'] and not flags[k]['o']]
@@ -856,26 +1100,32 @@ def _gogreen_longest_prefix_country(name, name_to_code):
     return None
 
 
-def _gogreen_resolve_segment_to_codes(name, name_to_code):
+def _gogreen_resolve_segment_to_codes(name, name_to_code, valid_codes=None):
     """
-    Resolve one pipe segment to a list of ISO codes (or fallback labels).
-    Uses longest-prefix match against dhl_country_codes keys, then comma splitting, so
-    ``SERBIA, REPUBLIC OF, IE ...`` and ``VENEZUELA, CR COSTA RICA`` resolve correctly.
+    Resolve one pipe segment to ISO codes from dhl_country_codes.txt only (GoGreen rules).
+    Uses longest-prefix match against dictionary keys, then comma splitting.
     """
+    if valid_codes is None:
+        valid_codes = _gogreen_valid_codes_from_file(name_to_code)
     name = _gogreen_normalize_comma_glue(name.strip())
     if not name:
         return []
 
-    direct = _country_to_codes_list(name, name_to_code)
+    pair_codes = _gogreen_try_code_name_pair(name, name_to_code, valid_codes)
+    if pair_codes:
+        return pair_codes
+
+    direct = _country_to_codes_list_gogreen(name, name_to_code, valid_codes)
     if direct:
         return direct
 
     pref = _gogreen_longest_prefix_country(name, name_to_code)
     if pref:
         first_codes, rest = pref
+        first_codes = [c for c in first_codes if c.upper() in valid_codes]
         if not rest:
             return first_codes
-        return first_codes + _gogreen_resolve_segment_to_codes(rest, name_to_code)
+        return first_codes + _gogreen_resolve_segment_to_codes(rest, name_to_code, valid_codes)
 
     if ',' not in name:
         return [name]
@@ -885,7 +1135,7 @@ def _gogreen_resolve_segment_to_codes(name, name_to_code):
         part = part.strip()
         if not part:
             continue
-        sub = _gogreen_resolve_segment_to_codes(part, name_to_code)
+        sub = _gogreen_resolve_segment_to_codes(part, name_to_code, valid_codes)
         out.extend(sub)
     return out
 
@@ -895,12 +1145,13 @@ def _gogreen_key_to_codes_csv(key, name_to_code):
     Map each pipe-separated country name to ISO codes; drop duplicate codes in order
     (e.g. US twice from different strings -> one US).
     """
+    valid_codes = _gogreen_valid_codes_from_file(name_to_code)
     seen = set()
     parts = []
     for name in key.split('|'):
         if not name:
             continue
-        for display in _gogreen_resolve_segment_to_codes(name, name_to_code):
+        for display in _gogreen_resolve_segment_to_codes(name, name_to_code, valid_codes):
             dedupe_key = display.upper()
             if dedupe_key in seen:
                 continue
@@ -909,37 +1160,160 @@ def _gogreen_key_to_codes_csv(key, name_to_code):
     return ', '.join(parts)
 
 
+def _gogreen_append_codes(out, seen, codes):
+    for c in codes:
+        key = (c or '').upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+
+
+def _gogreen_split_cell_segments(t):
+    """
+    Split a GoGreen cell on commas that precede the next ``CODE - NAME`` / ``CODE NAME`` entry.
+
+    Keeps suffixes such as ``NETHERLANDS, THE`` and ``SERBIA, REPUBLIC OF`` attached to the
+    country name (a plain ``[^,]+`` regex truncates at the first comma).
+    """
+    return re.split(r',\s*(?=[A-Z]{2,3}\s*(?:-|\s+[A-Z]))', t)
+
+
+def _gogreen_split_all_other_from_name(name):
+    """If ``name`` ends with ``, All other``, return (country_part, True)."""
+    if not name:
+        return name, False
+    m = _GOGREEN_ALL_OTHER_TAIL.search(name)
+    if m:
+        return name[: m.start()].strip().strip(',').strip(), True
+    return name, False
+
+
+def _gogreen_iter_country_names_from_cell(t):
+    """
+    Yield country/territory name strings from a normalized GoGreen Origin/Destination cell.
+    """
+    for part in _gogreen_split_cell_segments(t):
+        p = part.strip().lstrip('-').strip()
+        if not p:
+            continue
+        if p.lower().startswith('all other'):
+            yield 'All other'
+            continue
+        m = re.match(r'^([A-Z]{2,3})\s*-\s*(.*)$', p, re.DOTALL)
+        if m:
+            name = _normalize_gogreen_name_part(m.group(2))
+            name, had_all_other = _gogreen_split_all_other_from_name(name)
+            if name:
+                yield name
+            if had_all_other:
+                yield 'All other'
+            continue
+        m2 = re.match(r'^([A-Z]{2,3})\s+(.+)$', p)
+        if m2 and len(m2.group(1)) <= 3:
+            name = _normalize_gogreen_name_part(m2.group(2))
+            name, had_all_other = _gogreen_split_all_other_from_name(name)
+            if name:
+                yield name
+            if had_all_other:
+                yield 'All other'
+            continue
+        name = _normalize_gogreen_name_part(p)
+        name, had_all_other = _gogreen_split_all_other_from_name(name)
+        if name and name.lower() != 'all other':
+            yield name
+        if had_all_other or name.lower() == 'all other':
+            yield 'All other'
+
+
+def _gogreen_cell_to_codes(text, name_to_code):
+    """
+    Convert a raw GoGreen Origin/Destination cell to a comma-separated code list.
+    Uses the original cell text (not only parsed names) so OCR damage and
+    ``CODE NAME`` / ``= Country`` patterns still resolve.
+    """
+    if not text or not isinstance(text, str):
+        return ''
+    t = _normalize_gogreen_cell(text)
+    t = _strip_region_equals_prefix(t)
+    tl = t.lower()
+    if tl == 'all other' or tl.startswith('all other '):
+        return 'All other'
+
+    valid_codes = _gogreen_valid_codes_from_file(name_to_code)
+    seen = set()
+    out = []
+
+    for name in _gogreen_iter_country_names_from_cell(t):
+        if name.lower().startswith('all other'):
+            _gogreen_append_codes(out, seen, [name])
+            continue
+        _gogreen_append_codes(
+            out, seen, _country_to_codes_list_gogreen(name, name_to_code, valid_codes)
+        )
+
+    return ', '.join(out)
+
+
+def _gogreen_raw_text_by_block_key(rows):
+    """Best raw Origin/Destination string for each parsed block key (prefer longest)."""
+    raw_by_key = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        for field in ('Origin', 'Destination'):
+            val = row.get(field)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            names = parse_gogreen_block_names(val)
+            if names is None:
+                continue
+            key = _gogreen_block_key(names)
+            prev = raw_by_key.get(key)
+            if prev is None or len(val) > len(prev):
+                raw_by_key[key] = val
+    return raw_by_key
+
+
 def build_gogreen_block_txt_lines(rows, name_to_code):
     """
-    Build TXT lines ``Label  CODE1, CODE2, ...`` for every distinct GoGreen block
-    found in rows (same logic as Excel placeholders). Call before mutating cells.
+    Build one TXT line per GoGreen block (each Origin/Destination country list read).
+
+    Label is ``GoGreen_Americas`` when codes fully match the classical list; otherwise
+    ``GoGreen_Americas_1``, ``GoGreen_Americas_2``, etc.
     """
     order, flags = _collect_gogreen_block_roles(rows)
     if not flags:
         return []
-    label_by_key = _assign_gogreen_placeholder_labels(order, flags)
+    raw_by_key = _gogreen_raw_text_by_block_key(rows)
+    label_by_key = _assign_gogreen_placeholder_labels(order, flags, raw_by_key, name_to_code)
+
     lines = []
-    for key in sorted(label_by_key.keys(), key=lambda k: label_by_key[k]):
-        label = label_by_key[key]
-        codes = _gogreen_key_to_codes_csv(key, name_to_code)
-        lines.append(f'{label}  {codes}')
+    for key in order:
+        display = label_by_key.get(key)
+        if not display:
+            continue
+        raw = raw_by_key.get(key, '')
+        csv_str = _gogreen_cell_to_codes(raw, name_to_code) if raw else _gogreen_key_to_codes_csv(key, name_to_code)
+        if csv_str and csv_str.strip().lower().startswith('all other'):
+            lines.append(f'{display}  All other')
+            continue
+        codes = set(_gogreen_codes_from_csv_string(csv_str))
+        lines.append(_gogreen_format_canonical_zone_line(display, codes))
     return lines
 
 
 def apply_gogreen_placeholders_to_rows(rows, name_to_code):
     """
-    Replace Origin/Destination list strings with placeholder labels where blocks match.
+    Replace Origin/Destination list strings with canonical GoGreen zone labels.
     Returns TXT lines for CountryZoning_by_RateName.txt (GoGreen section).
     """
     order, flags = _collect_gogreen_block_roles(rows)
     if not flags:
         return []
-    label_by_key = _assign_gogreen_placeholder_labels(order, flags)
-    txt_lines = []
-    for key in sorted(label_by_key.keys(), key=lambda k: label_by_key[k]):
-        label = label_by_key[key]
-        codes = _gogreen_key_to_codes_csv(key, name_to_code)
-        txt_lines.append(f'{label}  {codes}')
+    raw_by_key = _gogreen_raw_text_by_block_key(rows)
+    label_by_key = _assign_gogreen_placeholder_labels(order, flags, raw_by_key, name_to_code)
+    txt_lines = build_gogreen_block_txt_lines(rows, name_to_code)
 
     for row in rows:
         if not isinstance(row, dict):
